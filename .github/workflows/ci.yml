@@ -1,25 +1,95 @@
 name: CI
 
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch with a `leg` input, so racecar can trigger a run and
+#      choose baseline vs instrumented. Upstream only fires on pull_request,
+#      which racecar cannot drive.
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action together. `chalk:` is the single variable separating
+#      the two arms, and `profile:` selects the observables profile.
+#   3. permissions: id-token: write for the action's OIDC connect, contents:
+#      read for checkout. Upstream declared no block and ran on the default
+#      token; these two are all any remaining job needs.
+#   4. A fail-closed assertion on the instrumented arm.
+#   5. The windows-latest and macos-15 desktop packaging jobs are removed:
+#      observables are gated to linux x86_64/aarch64, and we disable non-Linux
+#      runners in this fork. `futu_packaging` was their only consumer, so that
+#      change-detection output goes with them.
+#   6. Change detection is forced true on workflow_dispatch. dorny/paths-filter
+#      has no before-sha on a dispatch, so it falls back to "files in the last
+#      commit" -- which would make which jobs run depend on whatever landed
+#      last. Racecar needs the same jobs every time. The filter steps still run
+#      (they are part of upstream's cost); only the gate is overridden.
+#   7. concurrency: dispatched runs get a per-run group. Upstream keys on the
+#      ref with cancel-in-progress, which would make the baseline dispatch kill
+#      the instrumented one -- both are dispatched on the same ref.
+# Build and test COMMANDS are byte-identical to upstream.
+
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   pull_request:
     branches: [main]
 
+run-name: "CI ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # The one variable that separates the arms. On baseline, action-checkout skips
+  # its Set up Chalk step entirely.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
 
 jobs:
   changes:
     name: 🔎 Change Detection
     runs-on: ubuntu-latest
     outputs:
-      backend: ${{ steps.backend-filter.outputs.backend_non_web == 'true' || steps.filter.outputs.backend_contract_assets == 'true' || steps.filter.outputs.backend_web_contract == 'true' }}
-      docker: ${{ steps.filter.outputs.docker }}
-      frontend: ${{ steps.frontend-filter.outputs.frontend_code }}
-      futu_packaging: ${{ steps.filter.outputs.futu_packaging }}
+      backend: ${{ github.event_name == 'workflow_dispatch' || steps.backend-filter.outputs.backend_non_web == 'true' || steps.filter.outputs.backend_contract_assets == 'true' || steps.filter.outputs.backend_web_contract == 'true' }}
+      docker: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.docker == 'true' }}
+      frontend: ${{ github.event_name == 'workflow_dispatch' || steps.frontend-filter.outputs.frontend_code == 'true' }}
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          # Default is best-effort; a silently-uninstrumented run is a corrupt
+          # data point rather than a degraded one, so fail closed.
+          observables_continue_on_error: false
+          # Upstream used actions/checkout, which does not fetch LFS. Keep the
+          # tree identical to what upstream CI builds.
+          lfs: false
+
+      # Assert on the host-server socket, NOT on LD_PRELOAD: co-monitor's loader
+      # clears LD_PRELOAD once it has injected, so an empty LD_PRELOAD is what
+      # SUCCESS looks like from inside the shell. co-hostd daemonizes, so pgrep
+      # is no good either. Socket existence is what curiosity's own CI gates on.
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: 🧭 Filter paths
         id: filter
         uses: dorny/paths-filter@v3
@@ -37,9 +107,6 @@ jobs:
               - '!**/*.md'
             docker:
               - '{*.py,api/**,bot/**,data_provider/**,src/**,strategies/**,apps/dsa-web/**,docker/**,requirements.txt,.dockerignore,.github/workflows/ci.yml}'
-              - '!**/*.md'
-            futu_packaging:
-              - '{requirements.txt,main.py,src/brokers/futu/**,scripts/build-backend.ps1,scripts/build-backend-macos.sh,scripts/macos-signature-audit.sh,scripts/build-all.ps1,scripts/build-all-macos.sh,apps/dsa-desktop/**,.github/workflows/ci.yml,.github/workflows/desktop-release.yml}'
               - '!**/*.md'
       - name: 🧭 Filter backend-safe frontend paths
         id: backend-filter
@@ -68,7 +135,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
       - name: 🐍 Setup Python
         uses: actions/setup-python@v6
         with:
@@ -87,7 +164,17 @@ jobs:
         shard: [1, 2, 3]
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
       - name: 🐍 Setup Python
         uses: actions/setup-python@v6
         with:
@@ -159,9 +246,22 @@ jobs:
     if: needs.changes.outputs.docker == 'true'
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
       - name: 🛠️ Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
+      # Upstream caches the image layers in GHA. Left exactly as upstream has
+      # it; it must be disabled before any timing comparison, or we would be
+      # measuring cache-hit rate rather than instrumentation overhead.
       - name: 🐳 Build image
         uses: docker/build-push-action@v6
         with:
@@ -188,60 +288,6 @@ jobs:
           print('✅ All Docker imports OK')
           "
 
-  desktop-futu-package-windows:
-    name: desktop-futu-package-windows
-    runs-on: windows-latest
-    needs: [changes, ai-governance]
-    if: needs.changes.outputs.futu_packaging == 'true'
-    steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@v5
-      - name: 🐍 Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-          cache-dependency-path: requirements.txt
-      - name: 🟢 Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: apps/dsa-web/package-lock.json
-      - name: 📦 Install Web dependencies
-        shell: pwsh
-        run: npm ci --prefix apps/dsa-web
-      - name: 🧊 Build and verify frozen backend
-        shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File scripts/build-backend.ps1
-
-  desktop-futu-package-macos:
-    name: desktop-futu-package-macos
-    runs-on: macos-15
-    needs: [changes, ai-governance]
-    if: needs.changes.outputs.futu_packaging == 'true'
-    steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@v5
-      - name: 🐍 Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-          cache-dependency-path: requirements.txt
-      - name: 🟢 Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: apps/dsa-web/package-lock.json
-      - name: 📦 Install Web dependencies
-        run: npm ci --prefix apps/dsa-web
-      - name: 🧊 Build and verify frozen backend
-        run: bash scripts/build-backend-macos.sh
-      - name: 📦 Build and verify unsigned desktop package
-        run: bash scripts/build-desktop-macos.sh
-
   web-gate:
     name: web-gate
     runs-on: ubuntu-latest
@@ -252,7 +298,18 @@ jobs:
         working-directory: apps/dsa-web
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
       - name: 🟢 Setup Node
         uses: actions/setup-node@v6
         with:
