@@ -47,7 +47,7 @@ on:
 run-name: "CI ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
 
 concurrency:
-  group: ci-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
+  group: ci-${{ 'pull_request' == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -57,16 +57,16 @@ permissions:
 env:
   # The one variable that separates the arms. On baseline, action-checkout skips
   # its Set up Chalk step entirely.
-  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+  CHALK_ON: ${{ inputs.leg == 'instrumented' }}
 
 jobs:
   changes:
     name: 🔎 Change Detection
     runs-on: ubuntu-latest
     outputs:
-      backend: ${{ github.event_name == 'workflow_dispatch' || steps.backend-filter.outputs.backend_non_web == 'true' || steps.filter.outputs.backend_contract_assets == 'true' || steps.filter.outputs.backend_web_contract == 'true' }}
-      docker: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.docker == 'true' }}
-      frontend: ${{ github.event_name == 'workflow_dispatch' || steps.frontend-filter.outputs.frontend_code == 'true' }}
+      backend: ${{ 'pull_request' == 'workflow_dispatch' || steps.backend-filter.outputs.backend_non_web == 'true' || steps.filter.outputs.backend_contract_assets == 'true' || steps.filter.outputs.backend_web_contract == 'true' }}
+      docker: ${{ 'pull_request' == 'workflow_dispatch' || steps.filter.outputs.docker == 'true' }}
+      frontend: ${{ 'pull_request' == 'workflow_dispatch' || steps.frontend-filter.outputs.frontend_code == 'true' }}
     steps:
       - name: 📥 Checkout
         uses: crashappsec/action-checkout@main
